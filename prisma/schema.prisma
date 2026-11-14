@@ -1,0 +1,745 @@
+// PropertyLens database schema.
+// See docs/architecture/adr-0001-data-model.md for design rationale and
+// SPECIFICATION.md section 6 for the authoritative entity/invariant list.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & preferences
+// ---------------------------------------------------------------------------
+
+enum UserStatus {
+  active
+  suspended
+  deleted
+}
+
+enum Role {
+  user
+  admin
+}
+
+model User {
+  id          String     @id @default(cuid())
+  clerkId     String?    @unique
+  email       String     @unique
+  firstName   String?
+  lastName    String?
+  imageUrl    String?
+  locale      String     @default("en-US")
+  status      UserStatus @default(active)
+  role        Role       @default(user)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  preferences           UserPreference?
+  notificationPreference NotificationPreference?
+  subscription          Subscription?
+  entitlementPeriods     EntitlementPeriod[]
+  usageLedgerEntries     UsageLedgerEntry[]
+  creditReservations     CreditReservation[]
+  researchRuns           ResearchRun[]
+  savedProperties        SavedProperty[]
+  activityEvents         ActivityEvent[]
+  notifications          Notification[]
+  supportTickets         SupportTicket[]
+  supportMessages        SupportMessage[]
+  auditLogs              AuditLog[]
+
+  @@index([status])
+}
+
+model UserPreference {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  theme     String   @default("light")
+  timezone  String   @default("UTC")
+  updatedAt DateTime @updatedAt
+}
+
+model NotificationPreference {
+  id                  String   @id @default(cuid())
+  userId              String   @unique
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  researchReports     Boolean  @default(true)
+  usageAndPlanUpdates Boolean  @default(true)
+  billingAndPayments  Boolean  @default(true)
+  productUpdates      Boolean  @default(false)
+  tipsAndInsights     Boolean  @default(false)
+  digestFrequency     String   @default("real_time") // real_time | weekly | monthly
+  updatedAt           DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Plans, subscriptions, entitlements, usage ledger
+// ---------------------------------------------------------------------------
+
+enum PlanTier {
+  free
+  explorer
+  investor
+  professional
+}
+
+enum BillingInterval {
+  lifetime
+  monthly
+}
+
+model Plan {
+  id               String          @id @default(cuid())
+  tier             PlanTier        @unique
+  name             String
+  description      String
+  priceCents       Int
+  currency         String          @default("usd")
+  billingInterval   BillingInterval
+  lookupAllowance   Int? // null => unlimited (fair-use enforced separately)
+  isMostPopular     Boolean         @default(false)
+  sortOrder         Int             @default(0)
+  active            Boolean         @default(true)
+  features          Json            @default("[]")
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  subscriptions     Subscription[]
+}
+
+enum SubscriptionStatus {
+  active
+  past_due
+  cancelled
+  incomplete
+}
+
+model Subscription {
+  id                   String             @id @default(cuid())
+  userId               String             @unique
+  user                 User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planId               String
+  plan                 Plan               @relation(fields: [planId], references: [id])
+  status               SubscriptionStatus @default(active)
+  billingProviderId    String? // external subscription id (adapter-specific)
+  currentPeriodStart   DateTime           @default(now())
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean            @default(false)
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  entitlementPeriods   EntitlementPeriod[]
+  invoices             Invoice[]
+
+  @@index([status])
+}
+
+model EntitlementPeriod {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+  tier           PlanTier
+  lookupAllowance Int? // null => unlimited
+  periodStart    DateTime
+  periodEnd      DateTime?
+  isLifetime     Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  usageLedgerEntries  UsageLedgerEntry[]
+  creditReservations  CreditReservation[]
+
+  @@index([userId, periodStart])
+}
+
+model Invoice {
+  id                String   @id @default(cuid())
+  subscriptionId    String
+  subscription      Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  billingProviderId String?
+  amountCents       Int
+  currency          String   @default("usd")
+  status            String   @default("paid")
+  issuedAt          DateTime @default(now())
+  periodDescription String?
+  receiptUrl        String?
+
+  @@index([subscriptionId])
+}
+
+enum UsageLedgerEntryType {
+  reservation
+  settlement
+  release
+  grant
+  adjustment
+}
+
+// Append-only usage accounting; adjustments use compensating entries (never mutate history).
+model UsageLedgerEntry {
+  id                  String               @id @default(cuid())
+  userId              String
+  user                User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entitlementPeriodId String
+  entitlementPeriod   EntitlementPeriod    @relation(fields: [entitlementPeriodId], references: [id])
+  type                UsageLedgerEntryType
+  amount              Int // +1 grant, -1 consume, +1 release/compensate
+  researchRunId       String?
+  researchRun         ResearchRun?         @relation(fields: [researchRunId], references: [id])
+  reason              String?
+  createdAt           DateTime             @default(now())
+
+  @@index([userId, createdAt])
+}
+
+enum ReservationStatus {
+  reserved
+  settled
+  released
+}
+
+// One reservation per (user, idempotent run, entitlement period); transactional lifecycle.
+model CreditReservation {
+  id                  String             @id @default(cuid())
+  userId              String
+  user                User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entitlementPeriodId String
+  entitlementPeriod   EntitlementPeriod  @relation(fields: [entitlementPeriodId], references: [id])
+  researchRunId       String             @unique
+  researchRun         ResearchRun        @relation(fields: [researchRunId], references: [id])
+  idempotencyKey      String
+  status              ReservationStatus @default(reserved)
+  createdAt            DateTime          @default(now())
+  settledAt            DateTime?
+  releasedAt           DateTime?
+
+  @@unique([userId, idempotencyKey])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Properties, parcels, jurisdictions
+// ---------------------------------------------------------------------------
+
+model Jurisdiction {
+  id          String   @id @default(cuid())
+  name        String
+  level       String // county | city | state | federal | special_district
+  state       String
+  fipsCode    String?
+  createdAt   DateTime @default(now())
+
+  parcels     Parcel[]
+
+  @@index([state])
+}
+
+model Property {
+  id            String   @id @default(cuid())
+  propertyType  String   @default("single_family_residential")
+  primaryUse    String?
+  lotSizeAcres  Float?
+  lotSizeSqFt   Float?
+  livingAreaSqFt Float?
+  bedrooms      Int?
+  bathrooms     Float?
+  garageSpaces  Int?
+  yearBuilt     Int?
+  isDemoSample  Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  addresses        PropertyAddress[]
+  parcelLinks      ParcelPropertyLink[]
+  evidenceFacts     EvidenceFact[]
+  evidenceDocuments EvidenceDocument[]
+  researchRuns      ResearchRun[]
+  reports           ResearchReport[]
+  savedBy           SavedProperty[]
+  activityEvents    ActivityEvent[]
+  changes           PropertyChange[]
+  media             PropertyMedia[]
+}
+
+model PropertyAddress {
+  id           String   @id @default(cuid())
+  propertyId   String
+  property     Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  line1        String
+  line2        String?
+  city         String
+  state        String
+  postalCode   String
+  isPrimary    Boolean  @default(true)
+  latitude     Float?
+  longitude    Float?
+  normalizedKey String  @unique
+  createdAt    DateTime @default(now())
+
+  @@index([propertyId])
+}
+
+model Parcel {
+  id             String       @id @default(cuid())
+  jurisdictionId String
+  jurisdiction   Jurisdiction @relation(fields: [jurisdictionId], references: [id])
+  parcelNumber   String
+  legalDescription String?
+  acreage        Float?
+  geometry       Json? // GeoJSON geometry; PostGIS migration documented in docs/architecture
+  sourceUrl      String?
+  createdAt      DateTime     @default(now())
+
+  links          ParcelPropertyLink[]
+
+  @@unique([jurisdictionId, parcelNumber])
+}
+
+model ParcelPropertyLink {
+  id         String   @id @default(cuid())
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  parcelId   String
+  parcel     Parcel   @relation(fields: [parcelId], references: [id])
+  isPrimary  Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  @@unique([propertyId, parcelId])
+}
+
+model PropertyMedia {
+  id          String   @id @default(cuid())
+  propertyId  String
+  property    Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  url         String
+  altText     String?
+  attribution String?
+  licenseNote String?
+  sortOrder   Int      @default(0)
+  isPlaceholder Boolean @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([propertyId])
+}
+
+// ---------------------------------------------------------------------------
+// Public data sources & evidence
+// ---------------------------------------------------------------------------
+
+enum SourceHealthStatus {
+  healthy
+  degraded
+  down
+  unknown
+}
+
+model PublicDataSource {
+  id             String   @id @default(cuid())
+  key            String   @unique // e.g. "census-geocoder", "fema-nfhl"
+  name           String
+  domain         String // address | parcel | taxes | zoning | flood | ... (see spec 7.2)
+  jurisdictionScope String? // null => nationwide
+  licenseNote    String
+  attributionRequired Boolean @default(true)
+  rateLimitPerMinute  Int?
+  healthStatus   SourceHealthStatus @default(unknown)
+  lastCheckedAt  DateTime?
+  createdAt      DateTime @default(now())
+
+  evidenceFacts     EvidenceFact[]
+  evidenceDocuments EvidenceDocument[]
+
+  @@index([domain])
+}
+
+enum Verification {
+  verified
+  corroborated
+  unverified
+  conflicting
+}
+
+model EvidenceDocument {
+  id           String   @id @default(cuid())
+  propertyId   String
+  property     Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  sourceId     String
+  source       PublicDataSource @relation(fields: [sourceId], references: [id])
+  title        String
+  documentType String // deed | permit | ordinance_section | assessment_notice | ...
+  url          String?
+  pageCount    Int?
+  recordedAt   DateTime?
+  retrievedAt  DateTime @default(now())
+
+  facts        EvidenceFact[]
+
+  @@index([propertyId])
+}
+
+model EvidenceFact {
+  id               String   @id @default(cuid())
+  propertyId       String
+  property         Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  field            String
+  domain           String // ownership | assessment | zoning | market | history | environmental
+  value            Json
+  sourceId         String
+  source           PublicDataSource @relation(fields: [sourceId], references: [id])
+  documentId       String?
+  document         EvidenceDocument? @relation(fields: [documentId], references: [id])
+  sourceUrl        String?
+  retrievedAt      DateTime @default(now())
+  effectiveDate    DateTime?
+  verification     Verification @default(unverified)
+  evidenceReference String?
+  caveats          String[]      @default([])
+  createdAt        DateTime @default(now())
+
+  @@index([propertyId, domain])
+  @@index([propertyId, field])
+}
+
+// ---------------------------------------------------------------------------
+// Research runs, stages, reports, findings
+// ---------------------------------------------------------------------------
+
+enum RunStatus {
+  queued
+  resolving
+  retrieving
+  analyzing
+  assembling
+  completed
+  partial
+  failed
+  cancel_requested
+  cancelled
+}
+
+model ResearchRun {
+  id              String    @id @default(cuid())
+  userId          String?
+  user            User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  propertyId      String
+  property        Property  @relation(fields: [propertyId], references: [id])
+  idempotencyKey  String
+  researchProfile String    @default("standard")
+  status          RunStatus @default(queued)
+  isSample        Boolean   @default(false)
+  startedAt       DateTime  @default(now())
+  completedAt     DateTime?
+  errorMessage    String?
+
+  stages          ResearchStage[]
+  events          ResearchEvent[]
+  report          ResearchReport?
+  modelInvocations ModelInvocation[]
+  creditReservation CreditReservation?
+  usageLedgerEntries UsageLedgerEntry[]
+  costLedgerEntries CostLedgerEntry[]
+
+  @@unique([userId, idempotencyKey])
+  @@index([propertyId])
+  @@index([status])
+}
+
+model ResearchStage {
+  id            String    @id @default(cuid())
+  researchRunId String
+  researchRun   ResearchRun @relation(fields: [researchRunId], references: [id], onDelete: Cascade)
+  key           String // address_resolution | source_planning | parallel_retrieval | ...
+  label         String
+  status        String    @default("pending") // pending | in_progress | complete | failed | skipped
+  startedAt     DateTime?
+  completedAt   DateTime?
+  sortOrder     Int       @default(0)
+
+  @@index([researchRunId])
+}
+
+model ResearchEvent {
+  id            String    @id @default(cuid())
+  researchRunId String
+  researchRun   ResearchRun @relation(fields: [researchRunId], references: [id], onDelete: Cascade)
+  cursor        Int
+  type          String
+  message       String
+  sourceIds     String[]  @default([])
+  warnings      String[]  @default([])
+  createdAt     DateTime  @default(now())
+
+  @@unique([researchRunId, cursor])
+}
+
+enum CoverageStatus {
+  verified
+  partial
+  unavailable
+  not_applicable
+}
+
+model ResearchReport {
+  id              String    @id @default(cuid())
+  researchRunId   String    @unique
+  researchRun     ResearchRun @relation(fields: [researchRunId], references: [id], onDelete: Cascade)
+  propertyId      String
+  property        Property  @relation(fields: [propertyId], references: [id])
+  schemaVersion   String    @default("1.0")
+  promptVersion   String?
+  generatedAt     DateTime  @default(now())
+  overview        Json
+  ownership       Json
+  assessment      Json
+  zoning          Json
+  market          Json
+  history         Json
+  coverage        Json
+
+  findings        ResearchFinding[]
+  coverageAssessments CoverageAssessment[]
+
+  @@index([propertyId])
+}
+
+model ResearchFinding {
+  id                      String   @id @default(cuid())
+  reportId                String
+  report                  ResearchReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  domain                  String
+  title                   String
+  explanation             String
+  severity                String // critical | high | moderate | low | unknown
+  verification            Verification
+  evidenceIds             String[] @default([])
+  investmentImplication   String?
+  recommendedAction       String?
+  createdAt               DateTime @default(now())
+
+  @@index([reportId])
+}
+
+model CoverageAssessment {
+  id         String   @id @default(cuid())
+  reportId   String
+  report     ResearchReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  domain     String
+  status     CoverageStatus
+  note       String?
+
+  @@index([reportId])
+}
+
+// ---------------------------------------------------------------------------
+// AI invocation & cost ledgers
+// ---------------------------------------------------------------------------
+
+model ModelInvocation {
+  id               String   @id @default(cuid())
+  researchRunId    String
+  researchRun      ResearchRun @relation(fields: [researchRunId], references: [id], onDelete: Cascade)
+  stageKey         String
+  provider         String
+  model            String
+  promptVersion    String
+  providerRequestId String?
+  inputTokens      Int?
+  outputTokens     Int?
+  reasoningTokens  Int?
+  cachedTokens     Int?
+  estimatedCostCents Int?
+  pricingVersion   String?
+  latencyMs        Int?
+  retryCount       Int      @default(0)
+  success          Boolean  @default(true)
+  createdAt        DateTime @default(now())
+
+  @@index([researchRunId])
+}
+
+model CostLedgerEntry {
+  id            String   @id @default(cuid())
+  researchRunId String
+  researchRun   ResearchRun @relation(fields: [researchRunId], references: [id], onDelete: Cascade)
+  category      String // ai | external_request | storage
+  amountCents   Int
+  description   String?
+  createdAt     DateTime @default(now())
+
+  @@index([researchRunId])
+}
+
+// ---------------------------------------------------------------------------
+// Saved properties, activity, changes
+// ---------------------------------------------------------------------------
+
+model SavedProperty {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id])
+  notes      String?
+  tags       String[] @default([])
+  savedAt    DateTime @default(now())
+
+  @@unique([userId, propertyId])
+  @@index([userId])
+}
+
+model ActivityEvent {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  propertyId String?
+  property   Property? @relation(fields: [propertyId], references: [id])
+  category   String // saved | unsaved | research_started | research_completed | research_failed | report_refreshed | source_update | tax_change | ownership_change | zoning_change | notification_sent
+  title      String
+  description String
+  reportId   String?
+  eventTime  DateTime @default(now())
+  privacyScope String @default("private")
+
+  @@index([userId, eventTime])
+  @@index([propertyId])
+}
+
+model PropertyChange {
+  id          String   @id @default(cuid())
+  propertyId  String
+  property    Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  field       String
+  previousValue Json?
+  newValue    Json?
+  detectedAt  DateTime @default(now())
+
+  @@index([propertyId])
+}
+
+// ---------------------------------------------------------------------------
+// Help center & support
+// ---------------------------------------------------------------------------
+
+model HelpTopic {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  title       String
+  description String
+  icon        String?
+  sortOrder   Int      @default(0)
+
+  articles    HelpArticle[]
+}
+
+model HelpArticle {
+  id          String   @id @default(cuid())
+  topicId     String
+  topic       HelpTopic @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  slug        String   @unique
+  title       String
+  summary     String
+  content     String
+  sortOrder   Int      @default(0)
+  updatedAt   DateTime @updatedAt
+
+  @@index([topicId])
+}
+
+enum TicketStatus {
+  open
+  waiting
+  resolved
+  closed
+}
+
+model SupportTicket {
+  id          String       @id @default(cuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category    String
+  subject     String
+  status      TicketStatus @default(open)
+  propertyId  String?
+  reportId    String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  messages    SupportMessage[]
+  attachments SupportAttachment[]
+
+  @@index([userId])
+}
+
+model SupportMessage {
+  id        String   @id @default(cuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id])
+  body      String
+  createdAt DateTime @default(now())
+
+  @@index([ticketId])
+}
+
+model SupportAttachment {
+  id         String   @id @default(cuid())
+  ticketId   String
+  ticket     SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  fileName   String
+  mimeType   String
+  sizeBytes  Int
+  storageKey String
+  createdAt  DateTime @default(now())
+
+  @@index([ticketId])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications, webhooks, audit
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category  String
+  title     String
+  body      String
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  provider    String // clerk | billing
+  externalId  String
+  type        String
+  payload     Json
+  processedAt DateTime?
+  createdAt   DateTime @default(now())
+
+  @@unique([provider, externalId])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String
+  resourceType String
+  resourceId   String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([resourceType, resourceId])
+}
